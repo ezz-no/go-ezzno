@@ -227,7 +227,7 @@ imethods:
 				if tname.IsExported() || pkgPath == ipkg {
 					ifn := rtyp.textOff(t.Ifn)
 					if k == 0 {
-						fun0 = ifn // we'll set m.Fun[0] at the end
+						fun0 = ifn // we'll set m.fun[0] at the end
 					} else {
 						methods[k] = ifn
 					}
