@@ -11,6 +11,7 @@ import (
 	"go/importer"
 	"go/parser"
 	"go/token"
+	"internal/goversion"
 	"internal/testenv"
 	"reflect"
 	"regexp"
@@ -26,7 +27,7 @@ import (
 var nopos token.Pos
 
 func mustParse(fset *token.FileSet, src string) *ast.File {
-	f, err := parser.ParseFile(fset, pkgName(src), src, 0)
+	f, err := parser.ParseFile(fset, pkgName(src), src, parser.ParseComments)
 	if err != nil {
 		panic(err) // so we don't need to pass *testing.T
 	}
@@ -1895,12 +1896,12 @@ const Pi = 3.1415
 type T struct{}
 var Y, _ = lib.X, X
 
-func F(){
+func F[T *U, U any](param1, param2 int) /*param1=undef*/ (res1 /*res1=undef*/, res2 int) /*param1=var:12*/ /*res1=var:12*/ /*U=typename:12*/ {
 	const pi, e = 3.1415, /*pi=undef*/ 2.71828 /*pi=const:13*/ /*e=const:13*/
 	type /*t=undef*/ t /*t=typename:14*/ *t
 	print(Y) /*Y=var:10*/
 	x, Y := Y, /*x=undef*/ /*Y=var:10*/ Pi /*x=var:16*/ /*Y=var:16*/ ; _ = x; _ = Y
-	var F = /*F=func:12*/ F /*F=var:17*/ ; _ = F
+	var F = /*F=func:12*/ F[*int, int] /*F=var:17*/ ; _ = F
 
 	var a []int
 	for i, x := range a /*i=undef*/ /*x=var:16*/ { _ = i; _ = x }
@@ -1919,6 +1920,10 @@ func F(){
         	println(int)
         default /*int=var:31*/ :
         }
+
+	_ = param1
+	_ = res1
+	return
 }
 /*main=undef*/
 `
@@ -1980,8 +1985,29 @@ func F(){
 
 		_, gotObj := inner.LookupParent(id.Name, id.Pos())
 		if gotObj != wantObj {
-			t.Errorf("%s: got %v, want %v",
-				fset.Position(id.Pos()), gotObj, wantObj)
+			// Print the scope tree of mainScope in case of error.
+			var printScopeTree func(indent string, s *Scope)
+			printScopeTree = func(indent string, s *Scope) {
+				t.Logf("%sscope %s %v-%v = %v",
+					indent,
+					ScopeComment(s),
+					s.Pos(),
+					s.End(),
+					s.Names())
+				for i := range s.NumChildren() {
+					printScopeTree(indent+"  ", s.Child(i))
+				}
+			}
+			printScopeTree("", mainScope)
+
+			t.Errorf("%s: Scope(%s).LookupParent(%s@%v) got %v, want %v [scopePos=%v]",
+				fset.Position(id.Pos()),
+				ScopeComment(inner),
+				id.Name,
+				id.Pos(),
+				gotObj,
+				wantObj,
+				ObjectScopePos(wantObj))
 			continue
 		}
 	}
@@ -2849,11 +2875,28 @@ var _ = f(1, 2)
 	}
 }
 
+func TestModuleVersion(t *testing.T) {
+	// version go1.dd must be able to typecheck go1.dd.0, go1.dd.1, etc.
+	goversion := fmt.Sprintf("go1.%d", goversion.Version)
+	for _, v := range []string{
+		goversion,
+		goversion + ".0",
+		goversion + ".1",
+		goversion + ".rc",
+	} {
+		conf := Config{GoVersion: v}
+		pkg := mustTypecheck("package p", &conf, nil)
+		if pkg.GoVersion() != conf.GoVersion {
+			t.Errorf("got %s; want %s", pkg.GoVersion(), conf.GoVersion)
+		}
+	}
+}
+
 func TestFileVersions(t *testing.T) {
 	for _, test := range []struct {
-		moduleVersion string
-		fileVersion   string
-		wantVersion   string
+		goVersion   string
+		fileVersion string
+		wantVersion string
 	}{
 		{"", "", ""},                   // no versions specified
 		{"go1.19", "", "go1.19"},       // module version specified
@@ -2861,6 +2904,16 @@ func TestFileVersions(t *testing.T) {
 		{"go1.19", "go1.20", "go1.20"}, // file upgrade permitted
 		{"go1.20", "go1.19", "go1.20"}, // file downgrade not permitted
 		{"go1.21", "go1.19", "go1.19"}, // file downgrade permitted (module version is >= go1.21)
+
+		// versions containing release numbers
+		// (file versions containing release numbers are considered invalid)
+		{"go1.19.0", "", "go1.19.0"},         // no file version specified
+		{"go1.20", "go1.20.1", "go1.20"},     // file upgrade ignored
+		{"go1.20.1", "go1.20", "go1.20.1"},   // file upgrade ignored
+		{"go1.20.1", "go1.21", "go1.21"},     // file upgrade permitted
+		{"go1.20.1", "go1.19", "go1.20.1"},   // file downgrade not permitted
+		{"go1.21.1", "go1.19.1", "go1.21.1"}, // file downgrade not permitted (invalid file version)
+		{"go1.21.1", "go1.19", "go1.19"},     // file downgrade permitted (module version is >= go1.21)
 	} {
 		var src string
 		if test.fileVersion != "" {
@@ -2868,7 +2921,7 @@ func TestFileVersions(t *testing.T) {
 		}
 		src += "package p"
 
-		conf := Config{GoVersion: test.moduleVersion}
+		conf := Config{GoVersion: test.goVersion}
 		versions := make(map[*ast.File]string)
 		var info Info
 		info.FileVersions = versions

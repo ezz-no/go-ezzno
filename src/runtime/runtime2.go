@@ -593,6 +593,8 @@ type m struct {
 	lockedInt     uint32      // tracking for internal lockOSThread
 	nextwaitm     muintptr    // next m waiting for lock
 
+	mLockProfile mLockProfile // fields relating to runtime.lock contention
+
 	// wait* are used to carry arguments from gopark into park_m, because
 	// there's no stack to put them on. That is their sole purpose.
 	waitunlockf          func(*g, unsafe.Pointer) bool
@@ -855,7 +857,7 @@ type schedt struct {
 	sysmonwait atomic.Bool
 	sysmonnote note
 
-	// safepointFn should be called on each P at the next GC
+	// safePointFn should be called on each P at the next GC
 	// safepoint if p.runSafePointFn is set.
 	safePointFn   func(*p)
 	safePointWait int32
@@ -885,6 +887,27 @@ type schedt struct {
 	// totalMutexWaitTime is the sum of time goroutines have spent in _Gwaiting
 	// with a waitreason of the form waitReasonSync{RW,}Mutex{R,}Lock.
 	totalMutexWaitTime atomic.Int64
+
+	// stwStoppingTimeGC/Other are distributions of stop-the-world stopping
+	// latencies, defined as the time taken by stopTheWorldWithSema to get
+	// all Ps to stop. stwStoppingTimeGC covers all GC-related STWs,
+	// stwStoppingTimeOther covers the others.
+	stwStoppingTimeGC    timeHistogram
+	stwStoppingTimeOther timeHistogram
+
+	// stwTotalTimeGC/Other are distributions of stop-the-world total
+	// latencies, defined as the total time from stopTheWorldWithSema to
+	// startTheWorldWithSema. This is a superset of
+	// stwStoppingTimeGC/Other. stwTotalTimeGC covers all GC-related STWs,
+	// stwTotalTimeOther covers the others.
+	stwTotalTimeGC    timeHistogram
+	stwTotalTimeOther timeHistogram
+
+	// totalRuntimeLockWaitTime (plus the value of lockWaitTime on each M in
+	// allm) is the sum of time goroutines have spent in _Grunnable and with an
+	// M, but waiting for locks within the runtime. This field stores the value
+	// for Ms that have exited.
+	totalRuntimeLockWaitTime atomic.Int64
 }
 
 // Values for the flags field of a sigTabT.
@@ -1215,7 +1238,9 @@ var (
 	processorVersionInfo uint32
 	isIntel              bool
 
-	goarm uint8 // set by cmd/link on arm systems
+	// set by cmd/link on arm systems
+	goarm       uint8
+	goarmsoftfp uint8
 )
 
 // Set by the linker so the runtime can determine the buildmode.

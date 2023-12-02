@@ -25,12 +25,12 @@ func GOMAXPROCS(n int) int {
 		return ret
 	}
 
-	stopTheWorldGC(stwGOMAXPROCS)
+	stw := stopTheWorldGC(stwGOMAXPROCS)
 
 	// newprocs will be processed by startTheWorld
 	newprocs = int32(n)
 
-	startTheWorldGC()
+	startTheWorldGC(stw)
 	return ret
 }
 
@@ -50,6 +50,17 @@ func NumCgoCall() int64 {
 		n += int64(mp.ncgocall)
 	}
 	return n
+}
+
+func totalMutexWaitTimeNanos() int64 {
+	total := sched.totalMutexWaitTime.Load()
+
+	total += sched.totalRuntimeLockWaitTime.Load()
+	for mp := (*m)(atomic.Loadp(unsafe.Pointer(&allm))); mp != nil; mp = mp.alllink {
+		total += mp.mLockProfile.waitTime.Load()
+	}
+
+	return total
 }
 
 // NumGoroutine returns the number of goroutines that currently exist.

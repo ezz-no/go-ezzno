@@ -16,8 +16,9 @@ import (
 const (
 	UNW_FLAG_EHANDLER  = 1 << 3
 	UNW_FLAG_UHANDLER  = 2 << 3
-	UNW_FLAG_CHAININFO = 3 << 3
-	unwStaticDataSize  = 8
+	UNW_FLAG_CHAININFO = 4 << 3
+	unwStaticDataSize  = 4 // Bytes of unwind data before the variable length part.
+	unwCodeSize        = 2 // Bytes per unwind code.
 )
 
 // processSEH walks all pdata relocations looking for exception handler function symbols.
@@ -81,25 +82,26 @@ func findHandlerInXDataAMD64(ldr *loader.Loader, xsym sym.LoaderSym, add int64) 
 		// Nothing to do.
 		return 0
 	}
-	codes := data[3]
+	codes := data[2]
 	if codes%2 != 0 {
 		// There are always an even number of unwind codes, even if the last one is unused.
 		codes += 1
 	}
 	// The exception handler relocation is the first relocation after the unwind codes,
 	// unless it is chained, but we will handle this case later.
-	targetOff := add + unwStaticDataSize*(1+int64(codes))
+	targetOff := add + unwStaticDataSize + unwCodeSize*int64(codes)
 	xrels := ldr.Relocs(xsym)
-	idx := sort.Search(xrels.Count(), func(i int) bool {
+	xrelsCount := xrels.Count()
+	idx := sort.Search(xrelsCount, func(i int) bool {
 		return int64(xrels.At(i).Off()) >= targetOff
 	})
-	if idx == 0 {
+	if idx == xrelsCount {
 		return 0
 	}
 	if isChained {
 		// The third relocations references the next .xdata entry in the chain, recurse.
 		idx += 2
-		if idx >= xrels.Count() {
+		if idx >= xrelsCount {
 			return 0
 		}
 		r := xrels.At(idx)

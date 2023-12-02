@@ -46,7 +46,7 @@ type resultUseAnalyzer struct {
 // rescoreBasedOnCallResultUses examines how call results are used,
 // and tries to update the scores of calls based on how their results
 // are used in the function.
-func rescoreBasedOnCallResultUses(fn *ir.Func, resultNameTab map[*ir.Name]resultPropAndCS, cstab CallSiteTab) {
+func (csa *callSiteAnalyzer) rescoreBasedOnCallResultUses(fn *ir.Func, resultNameTab map[*ir.Name]resultPropAndCS, cstab CallSiteTab) {
 	enableDebugTraceIfEnv()
 	rua := &resultUseAnalyzer{
 		resultNameTab:    resultNameTab,
@@ -65,7 +65,7 @@ func rescoreBasedOnCallResultUses(fn *ir.Func, resultNameTab map[*ir.Name]result
 	disableDebugTrace()
 }
 
-func examineCallResults(cs *CallSite, resultNameTab map[*ir.Name]resultPropAndCS) {
+func (csa *callSiteAnalyzer) examineCallResults(cs *CallSite, resultNameTab map[*ir.Name]resultPropAndCS) map[*ir.Name]resultPropAndCS {
 	if debugTrace&debugTraceScoring != 0 {
 		fmt.Fprintf(os.Stderr, "=-= examining call results for %q\n",
 			EncodeCallSiteKey(cs))
@@ -79,7 +79,7 @@ func examineCallResults(cs *CallSite, resultNameTab map[*ir.Name]resultPropAndCS
 	//
 	names, autoTemps, props := namesDefined(cs)
 	if len(names) == 0 {
-		return
+		return resultNameTab
 	}
 
 	if debugTrace&debugTraceScoring != 0 {
@@ -103,10 +103,12 @@ func examineCallResults(cs *CallSite, resultNameTab map[*ir.Name]resultPropAndCS
 		if rprop&interesting == 0 {
 			continue
 		}
-		if ir.Reassigned(n) {
+		if csa.nameFinder.reassigned(n) {
 			continue
 		}
-		if _, ok := resultNameTab[n]; ok {
+		if resultNameTab == nil {
+			resultNameTab = make(map[*ir.Name]resultPropAndCS)
+		} else if _, ok := resultNameTab[n]; ok {
 			panic("should never happen")
 		}
 		entry := resultPropAndCS{
@@ -121,6 +123,7 @@ func examineCallResults(cs *CallSite, resultNameTab map[*ir.Name]resultPropAndCS
 			fmt.Fprintf(os.Stderr, "=-= add resultNameTab table entry n=%v autotemp=%v props=%s\n", n, autoTemps[idx], rprop.String())
 		}
 	}
+	return resultNameTab
 }
 
 // namesDefined returns a list of ir.Name's corresponding to locals

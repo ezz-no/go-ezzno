@@ -206,6 +206,17 @@ func (o *ordering) advance(ev *baseEvent, evt *evTable, m ThreadID, gen uint64) 
 
 		// Validate that the M we're stealing from is what we expect.
 		mid := ThreadID(ev.args[2]) // The M we're stealing from.
+
+		if mid == curCtx.M {
+			// We're stealing from ourselves. This behaves like a ProcStop.
+			if curCtx.P != pid {
+				return curCtx, false, fmt.Errorf("tried to self-steal proc %d (thread %d), but got proc %d instead", pid, mid, curCtx.P)
+			}
+			newCtx.P = NoProc
+			return curCtx, true, nil
+		}
+
+		// We're stealing from some other M.
 		mState, ok := o.mStates[mid]
 		if !ok {
 			return curCtx, false, fmt.Errorf("stole proc from non-existent thread %d", mid)
@@ -306,7 +317,7 @@ func (o *ordering) advance(ev *baseEvent, evt *evTable, m ThreadID, gen uint64) 
 		}
 		o.gStates[newgid] = &gState{id: newgid, status: go122.GoRunnable, seq: makeSeq(gen, 0)}
 		return curCtx, true, nil
-	case go122.EvGoDestroy, go122.EvGoStop, go122.EvGoBlock, go122.EvGoSyscallBegin:
+	case go122.EvGoDestroy, go122.EvGoStop, go122.EvGoBlock:
 		// These are goroutine events that all require an active running
 		// goroutine on some thread. They must *always* be advance-able,
 		// since running goroutines are bound to their M.
@@ -335,14 +346,6 @@ func (o *ordering) advance(ev *baseEvent, evt *evTable, m ThreadID, gen uint64) 
 			// Goroutine blocked. It's waiting now and not running on this M.
 			state.status = go122.GoWaiting
 			newCtx.G = NoGoroutine
-		case go122.EvGoSyscallBegin:
-			// Goroutine entered a syscall. It's still running on this P and M.
-			state.status = go122.GoSyscall
-			pState, ok := o.pStates[curCtx.P]
-			if !ok {
-				return curCtx, false, fmt.Errorf("uninitialized proc %d found during %s", curCtx.P, go122.EventString(typ))
-			}
-			pState.status = go122.ProcSyscall
 		}
 		return curCtx, true, nil
 	case go122.EvGoStart:
@@ -379,6 +382,43 @@ func (o *ordering) advance(ev *baseEvent, evt *evTable, m ThreadID, gen uint64) 
 		state.seq = seq
 		// N.B. No context to validate. Basically anything can unblock
 		// a goroutine (e.g. sysmon).
+		return curCtx, true, nil
+	case go122.EvGoSyscallBegin:
+		// Entering a syscall requires an active running goroutine with a
+		// proc on some thread. It is always advancable.
+		if err := validateCtx(curCtx, event.UserGoReqs); err != nil {
+			return curCtx, false, err
+		}
+		state, ok := o.gStates[curCtx.G]
+		if !ok {
+			return curCtx, false, fmt.Errorf("event %s for goroutine (%v) that doesn't exist", go122.EventString(typ), curCtx.G)
+		}
+		if state.status != go122.GoRunning {
+			return curCtx, false, fmt.Errorf("%s event for goroutine that's not %s", go122.EventString(typ), GoRunning)
+		}
+		// Goroutine entered a syscall. It's still running on this P and M.
+		state.status = go122.GoSyscall
+		pState, ok := o.pStates[curCtx.P]
+		if !ok {
+			return curCtx, false, fmt.Errorf("uninitialized proc %d found during %s", curCtx.P, go122.EventString(typ))
+		}
+		pState.status = go122.ProcSyscall
+		// Validate the P sequence number on the event and advance it.
+		//
+		// We have a P sequence number for what is supposed to be a goroutine event
+		// so that we can correctly model P stealing. Without this sequence number here,
+		// the syscall from which a ProcSteal event is stealing can be ambiguous in the
+		// face of broken timestamps. See the go122-syscall-steal-proc-ambiguous test for
+		// more details.
+		//
+		// Note that because this sequence number only exists as a tool for disambiguation,
+		// we can enforce that we have the right sequence number at this point; we don't need
+		// to back off and see if any other events will advance. This is a running P.
+		pSeq := makeSeq(gen, ev.args[0])
+		if !pSeq.succeeds(pState.seq) {
+			return curCtx, false, fmt.Errorf("failed to advance %s: can't make sequence: %s -> %s", go122.EventString(typ), pState.seq, pSeq)
+		}
+		pState.seq = pSeq
 		return curCtx, true, nil
 	case go122.EvGoSyscallEnd:
 		// This event is always advance-able because it happens on the same
@@ -445,7 +485,7 @@ func (o *ordering) advance(ev *baseEvent, evt *evTable, m ThreadID, gen uint64) 
 		// This event indicates that a goroutine is effectively
 		// being created out of a cgo callback. Such a goroutine
 		// is 'created' in the syscall state.
-		if err := validateCtx(curCtx, event.SchedReqs{Thread: event.MustHave, Proc: event.MustNotHave, Goroutine: event.MustNotHave}); err != nil {
+		if err := validateCtx(curCtx, event.SchedReqs{Thread: event.MustHave, Proc: event.MayHave, Goroutine: event.MustNotHave}); err != nil {
 			return curCtx, false, err
 		}
 		// This goroutine is effectively being created. Add a state for it.
@@ -496,6 +536,13 @@ func (o *ordering) advance(ev *baseEvent, evt *evTable, m ThreadID, gen uint64) 
 		// Get the parent ID, but don't validate it. There's no guarantee
 		// we actually have information on whether it's active.
 		parentID := TaskID(ev.args[1])
+		if parentID == BackgroundTask {
+			// Note: a value of 0 here actually means no parent, *not* the
+			// background task. Automatic background task attachment only
+			// applies to regions.
+			parentID = NoTask
+			ev.args[1] = uint64(NoTask)
+		}
 
 		// Validate the name and record it. We'll need to pass it through to
 		// EvUserTaskEnd.
